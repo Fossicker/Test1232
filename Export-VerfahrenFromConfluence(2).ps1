@@ -205,6 +205,10 @@ $OutputPathDatenbank = '.\Verfahren-Datenbanken.csv'
 # der ersten Spalte stehen. Umlaute als ae/oe/ue/ss, ein Teil des Textes reicht.
 $ExportAufbau     = $true
 $OutputPathAufbau = '.\Verfahren-Aufbau.csv'
+# Ueberschrift der Tabelle auf der Seite. Ist sie gesetzt, wird genau diese
+# Tabelle ausgewertet - das ist die sicherste Zuordnung. Ein Teil des Textes
+# reicht. Leer lassen, um nur ueber die Kategorien zu suchen.
+$AufbauTitel      = 'Aufbau Anwendungsserver'
 $AufbauKategorien = @(
     'Appliance'
     'Betriebssystem'
@@ -214,19 +218,29 @@ $AufbauKategorien = @(
 )
 
 # --- Tabelle 8: Umsysteme (jeweils einzeln) --------------------------------
-# Gleicher Aufbau wie Tabelle 7, nur mit anderen Kategorien. Die Kategorie
-# landet hier in der Spalte "Umsysteme".
-# Achtung: "Appliance" kommt in beiden Tabellen vor. Unterschieden werden sie
-# ueber die jeweils zweite gefundene Kategorie - deshalb muessen immer
-# mindestens zwei Kategorien der Liste in Spalte 1 stehen.
+# Eigenstaendige Tabelle mit gleichem Aufbau wie Tabelle 7, aber anderen
+# Kategorien. Die Kategorie landet in der Spalte "Umsysteme".
+# "Appliance" kommt in beiden Tabellen vor - deshalb wird die Tabelle in
+# erster Linie ueber ihre Ueberschrift zugeordnet.
 $ExportUmsysteme     = $true
 $OutputPathUmsysteme = '.\Verfahren-Umsysteme.csv'
+$UmsystemeTitel      = 'Umsysteme'
 $UmsystemeKategorien = @(
     'Appliance'
     'Datenbank'
     'Netzwerk Dienste'
     'Sonstige'
 )
+
+# Gilt fuer Tabelle 7 und 8:
+# $true  = Eine Gruppenueberschrift, die NICHT in der Kategorienliste steht,
+#          beendet den laufenden Block. Zeilen darunter werden uebersprungen,
+#          bis wieder eine gesuchte Kategorie kommt. Verhindert, dass fremde
+#          Bloecke derselben Tabelle mit exportiert werden.
+# $false = Fremde Ueberschriften werden ignoriert, die zuletzt erkannte
+#          Kategorie gilt weiter. Nur noetig, wenn zwischen Kategorie und
+#          Daten Hinweiszeilen stehen ("bitte pro Umsystem eine Zeile").
+$KategorieBlockStrikt = $true
 
 # --- Suchumfang ------------------------------------------------------------
 # $false = alle Ebenen unterhalb der Elternseite
@@ -504,6 +518,43 @@ function Get-StorageTables {
     }
 
     return ,$tables.ToArray()
+}
+
+function Get-StorageTableTitles {
+    # Liefert zu jeder Tabelle die Ueberschrift, die unmittelbar davor steht -
+    # in derselben Reihenfolge wie Get-StorageTables. Damit laesst sich eine
+    # Tabelle ueber ihren Titel identifizieren statt nur ueber ihren Inhalt.
+    # Beruecksichtigt <h1>..<h6> und fett gesetzte Absaetze. Gesucht wird nur
+    # im Text zwischen der vorherigen und dieser Tabelle, damit ein Titel nicht
+    # auf mehrere Tabellen abfaerbt.
+    param([string]$Storage)
+
+    $titles = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Storage)) { return ,$titles.ToArray() }
+
+    $letztesEnde = 0
+
+    foreach ($tableMatch in [regex]::Matches($Storage, '<table\b[^>]*>(.*?)</table>', 'Singleline, IgnoreCase')) {
+
+        # nur Tabellen mit Zeilen zaehlen - Get-StorageTables macht es genauso
+        if (-not [regex]::IsMatch($tableMatch.Groups[1].Value, '<tr\b', 'IgnoreCase')) { continue }
+
+        $vorText = $Storage.Substring($letztesEnde, $tableMatch.Index - $letztesEnde)
+        $titel   = ''
+
+        $muster  = '<(h[1-6])\b[^>]*>(.*?)</\1>|<p\b[^>]*>\s*<strong>(.*?)</strong>\s*</p>'
+        $treffer = [regex]::Matches($vorText, $muster, 'Singleline, IgnoreCase')
+        if ($treffer.Count -gt 0) {
+            $letzter = $treffer[$treffer.Count - 1]
+            $roh     = if ($letzter.Groups[2].Success) { $letzter.Groups[2].Value } else { $letzter.Groups[3].Value }
+            $titel   = ConvertFrom-StorageHtml $roh
+        }
+
+        $titles.Add($titel) | Out-Null
+        $letztesEnde = $tableMatch.Index + $tableMatch.Length
+    }
+
+    return ,$titles.ToArray()
 }
 
 function Get-NormalizedKey {
@@ -1073,11 +1124,31 @@ function Get-KategorieTabelle {
     # Liefert Found, Spalten (Ueberschriften) und Rows (Kategorie + Werte).
     param(
         [Parameter(Mandatory)]$Tables,
-        [Parameter(Mandatory)][string[]]$Kategorien
+        [Parameter(Mandatory)][string[]]$Kategorien,
+        $Titel = @(),          # Ueberschriften der Tabellen (gleiche Reihenfolge)
+        [string]$TitelFilter = ''   # wenn gesetzt: nur diese Tabelle auswerten
     )
 
     $rowsOut = New-Object System.Collections.Generic.List[object]
     $spalten = New-Object System.Collections.Generic.List[string]
+
+    # Steht ein Titel fest, wird genau die Tabelle mit dieser Ueberschrift
+    # ausgewertet. Nur wenn keine passt, wird ueber die Kategorien gesucht.
+    $nurIndex = -1
+    if ($TitelFilter) {
+        $filterKey = Get-NormalizedKey $TitelFilter
+        for ($t = 0; $t -lt $Tables.Count; $t++) {
+            if ($Titel.Count -le $t) { break }
+            $tk = Get-NormalizedKey $Titel[$t]
+            if ($tk -and $filterKey -and $tk.Contains($filterKey)) { $nurIndex = $t; break }
+        }
+        if ($nurIndex -ge 0) {
+            Write-Verbose "  Tabelle ueber Ueberschrift '$($Titel[$nurIndex])' gefunden"
+        }
+        else {
+            Write-Verbose "  Keine Tabelle mit Ueberschrift '$TitelFilter' - Suche ueber die Kategorien"
+        }
+    }
 
     # Liefert den Kategorienamen, wenn der Text einer Kategorie entspricht
     function Resolve-Kategorie {
@@ -1096,16 +1167,26 @@ function Get-KategorieTabelle {
         return $null
     }
 
-    foreach ($table in $Tables) {
+    for ($tIdx = 0; $tIdx -lt $Tables.Count; $tIdx++) {
+
+        # Wurde die Tabelle ueber die Ueberschrift bestimmt, nur diese ansehen
+        if ($nurIndex -ge 0 -and $tIdx -ne $nurIndex) { continue }
+
+        $table = $Tables[$tIdx]
         if ($table.Count -lt 2) { continue }
 
-        # Tabelle erkennen: mindestens zwei Kategorien in der ersten Spalte
+        # Kategoriezeilen der ersten Spalte suchen
         $katZeilen = New-Object System.Collections.Generic.List[int]
         for ($r = 0; $r -lt $table.Count; $r++) {
             if ($table[$r].Count -lt 1) { continue }
             if (Resolve-Kategorie -Text $table[$r][0] -Liste $Kategorien) { $katZeilen.Add($r) | Out-Null }
         }
-        if ($katZeilen.Count -lt 2) { continue }
+
+        # Ohne Titeltreffer muessen mindestens zwei Kategorien zusammenkommen,
+        # damit nicht die falsche Tabelle erwischt wird. Steht die Tabelle ueber
+        # ihre Ueberschrift fest, genuegt eine.
+        $mindest = if ($nurIndex -ge 0) { 1 } else { 2 }
+        if ($katZeilen.Count -lt $mindest) { continue }
 
         # Modus bestimmen: stehen neben den Kategorienamen noch Werte?
         $mitWertenDaneben = 0
@@ -1145,12 +1226,33 @@ function Get-KategorieTabelle {
             $kat   = Resolve-Kategorie -Text $erste -Liste $Kategorien
             $rest  = @($row | Select-Object -Skip 1 | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
 
-            # Kategoriezeile ohne eigene Werte: nur die Kategorie merken
-            if ($kat -and $rest.Count -eq 0 -and $offset -eq 0) {
-                $aktuelleKategorie = $erste
-                continue
+            if ($offset -eq 0) {
+                # Variante A: eine Zeile mit nur einer gefuellten Zelle ist eine
+                # Gruppenueberschrift. Steht sie in der Kategorienliste, gelten
+                # die folgenden Zeilen fuer sie. Ist sie eine FREMDE Ueberschrift
+                # (ein Block, der nicht exportiert werden soll), endet der
+                # bisherige Block - sonst wuerden dessen Zeilen faelschlich
+                # unter der zuletzt erkannten Kategorie landen.
+                if ($rest.Count -eq 0 -and $erste) {
+                    if ($kat) {
+                        $aktuelleKategorie = $erste
+                    }
+                    elseif ($KategorieBlockStrikt) {
+                        Write-Verbose "  Fremder Block '$erste' - Zeilen darunter werden uebersprungen"
+                        $aktuelleKategorie = ''
+                    }
+                    continue
+                }
             }
-            if ($kat) { $aktuelleKategorie = $erste }
+            else {
+                # Variante B: jede Zeile traegt ihre Kategorie in Spalte 1.
+                # Zeilen mit einer anderen Beschriftung gehoeren nicht dazu.
+                if (-not $kat) {
+                    Write-Verbose "  Zeile '$erste' ist keine gesuchte Kategorie - uebersprungen"
+                    continue
+                }
+                $aktuelleKategorie = $erste
+            }
 
             # Werte ab Offset einsammeln
             $werte = New-Object System.Collections.Generic.List[string]
@@ -1162,7 +1264,8 @@ function Get-KategorieTabelle {
             $hatInhalt = @($werte | Where-Object { $_ -ne '' }).Count -gt 0
             if (-not $hatInhalt) { continue }
 
-            # Zeilen vor der ersten Kategorie gehoeren zu keiner - ueberspringen
+            # Zeilen vor der ersten Kategorie oder nach einem fremden Block
+            # gehoeren zu keiner gesuchten Kategorie
             if (-not $aktuelleKategorie) { continue }
 
             $nr++
@@ -1269,7 +1372,8 @@ foreach ($page in $pages) {
         $storage = [string]$page.body.storage.value
     }
 
-    $tables = Get-StorageTables -Storage $storage
+    $tables      = Get-StorageTables -Storage $storage
+    $tableTitles = Get-StorageTableTitles -Storage $storage
 
     # --- Tabelle 1: Verfahren / Beschreibung ---
     $verfahren    = Get-CellValueByLabel -Tables $tables -Label $NameLabel
@@ -1365,7 +1469,7 @@ foreach ($page in $pages) {
     # --- Tabelle 7: Aufbau Anwendungsserver ---
     $aufbau = @()
     if ($ExportAufbau) {
-        $aufbauResult = Get-KategorieTabelle -Tables $tables -Kategorien $AufbauKategorien
+        $aufbauResult = Get-KategorieTabelle -Tables $tables -Kategorien $AufbauKategorien -Titel $tableTitles -TitelFilter $AufbauTitel
         $aufbau       = $aufbauResult.Rows
         if ($aufbauResult.Found) {
             # Spaltennamen ueber alle Seiten vereinheitlichen
@@ -1382,7 +1486,7 @@ foreach ($page in $pages) {
     # --- Tabelle 8: Umsysteme ---
     $umsysteme = @()
     if ($ExportUmsysteme) {
-        $umsysResult = Get-KategorieTabelle -Tables $tables -Kategorien $UmsystemeKategorien
+        $umsysResult = Get-KategorieTabelle -Tables $tables -Kategorien $UmsystemeKategorien -Titel $tableTitles -TitelFilter $UmsystemeTitel
         $umsysteme   = $umsysResult.Rows
         if ($umsysResult.Found) {
             for ($i = 0; $i -lt $umsysResult.Spalten.Count; $i++) {
